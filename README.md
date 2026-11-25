@@ -86,6 +86,8 @@ export HF_HUB_OFFLINE=1
 
 `modelId` can be changed to any HuggingFace token-classification model.
 
+`ignoreLabels` (optional, default `[]`) lists categories that are *not* redacted, e.g. `["private_url", "private_date"]`. Because the file lives in `.pi/`, this is configured per project. The server is started with `PII_IGNORE_LABELS` (comma-separated), so changes take effect on the next session or `/pii on`.
+
 ## Footer states
 
 | Footer | Meaning |

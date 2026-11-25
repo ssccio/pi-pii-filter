@@ -10,6 +10,7 @@ export interface PiiFilterConfig {
   enabled: boolean;
   logging: boolean;
   modelId: string;
+  ignoreLabels: string[];
 }
 
 export function normalizeConfig(raw: unknown): PiiFilterConfig {
@@ -18,6 +19,9 @@ export function normalizeConfig(raw: unknown): PiiFilterConfig {
     enabled: typeof r.enabled === "boolean" ? r.enabled : false,
     logging: typeof r.logging === "boolean" ? r.logging : false,
     modelId: typeof r.modelId === "string" ? r.modelId : "openai/privacy-filter",
+    ignoreLabels: Array.isArray(r.ignoreLabels)
+      ? r.ignoreLabels.filter((l): l is string => typeof l === "string")
+      : [],
   };
 }
 
@@ -162,6 +166,7 @@ export async function spawnServer(
   projectRoot: string,
   modelId: string,
   port: number,
+  ignoreLabels: string[] = [],
 ): Promise<ServerHandle> {
   const pythonBin = path.join(projectRoot, ".venv", "bin", "python");
   const serverDir = path.join(projectRoot, ".pi", "extensions", "pii-filter");
@@ -170,7 +175,11 @@ export async function spawnServer(
     ["-m", "uvicorn", "server:app", "--port", String(port), "--log-level", "warning"],
     {
       cwd: serverDir,
-      env: { ...process.env, PII_MODEL_ID: modelId },
+      env: {
+        ...process.env,
+        PII_MODEL_ID: modelId,
+        PII_IGNORE_LABELS: ignoreLabels.join(","),
+      },
       stdio: ["ignore", "ignore", "ignore"],
     },
   );
@@ -244,12 +253,18 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
   async function startServer(
     ctx: { hasUI: boolean; ui: { notify(msg: string, level: string): void; setStatus(id: string, v: string | undefined): void } },
   ): Promise<void> {
-    if (!ctx.hasUI) return;
     serverReady = false;
-    ctx.ui.setStatus("pii-filter", "⏳ PII loading...");
+    // The sidecar must run even without a UI (print/RPC mode); otherwise the
+    // context hook silently passes everything through unredacted.
+    const status = (v: string | undefined) => { if (ctx.hasUI) ctx.ui.setStatus("pii-filter", v); };
+    const notify = (msg: string, level: string) => {
+      if (ctx.hasUI) ctx.ui.notify(msg, level);
+      else console.error(`[pii-filter] ${msg}`);
+    };
+    status("⏳ PII loading...");
     try {
       const port = await findFreePort();
-      serverHandle = await spawnServer(projectRoot, config.modelId, port);
+      serverHandle = await spawnServer(projectRoot, config.modelId, port, config.ignoreLabels);
 
       serverHandle.process.on("exit", () => {
         if (!restartState.disabled && config.enabled) {
@@ -261,8 +276,8 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
       if (!ready) {
         killServer(serverHandle);
         serverHandle = null;
-        ctx.ui.setStatus("pii-filter", "⚠ PII");
-        ctx.ui.notify(
+        status("⚠ PII");
+        notify(
           "PII Filter: server did not become ready within 120s. Run /pii on to retry.",
           "warning",
         );
@@ -274,8 +289,8 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
       errorNotifiedThisSession = false;
       setFooter(ctx as any);
     } catch (err) {
-      ctx.ui.setStatus("pii-filter", "⚠ PII");
-      ctx.ui.notify(`PII Filter: failed to start server — ${String(err)}`, "error");
+      status("⚠ PII");
+      notify(`PII Filter: failed to start server — ${String(err)}`, "error");
       config.enabled = false;
       await saveConfig();
     }
@@ -284,18 +299,23 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
   function _handleServerExit(ctx: { hasUI: boolean; ui: { notify(msg: string, level: string): void; setStatus(id: string, v: string | undefined): void } }): void {
     serverHandle = null;
     serverReady = false;
+    const status = (v: string | undefined) => { if (ctx.hasUI) ctx.ui.setStatus("pii-filter", v); };
+    const notify = (msg: string, level: string) => {
+      if (ctx.hasUI) ctx.ui.notify(msg, level);
+      else console.error(`[pii-filter] ${msg}`);
+    };
     if (!shouldRestart(restartState)) {
-      ctx.ui.setStatus("pii-filter", "⚠ PII");
-      ctx.ui.notify(
+      status("⚠ PII");
+      notify(
         "PII Filter: server crashed 3 times. Filtering disabled. Run /pii on to re-enable.",
         "error",
       );
       config.enabled = false;
-      saveConfig().catch((e) => ctx.ui.notify(`PII Filter: failed to persist config — ${String(e)}`, "warning"));
+      saveConfig().catch((e) => notify(`PII Filter: failed to persist config — ${String(e)}`, "warning"));
       return;
     }
     restartState = recordRestartAttempt(restartState);
-    ctx.ui.notify(
+    notify(
       `PII Filter: server exited unexpectedly (attempt ${restartState.attempts}/3), restarting in 2s...`,
       "warning",
     );
@@ -307,12 +327,16 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-  const PII_SYSTEM_NOTE = "\n\n[PII Filter active: all personally identifiable information in this conversation has been automatically redacted and replaced with typed placeholders — [private_person], [private_email], [private_phone], [private_address], [private_url], [private_date], [account_number], [secret]. Treat these as intentional redactions of real values, not template artifacts.]";
+  const ALL_LABELS = ["private_person", "private_email", "private_phone", "private_address", "private_url", "private_date", "account_number", "secret"];
+  function piiSystemNote(): string {
+    const active = ALL_LABELS.filter((l) => !config.ignoreLabels.includes(l)).map((l) => `[${l}]`).join(", ");
+    return `\n\n[PII Filter active: all personally identifiable information in this conversation has been automatically redacted and replaced with typed placeholders — ${active}. Treat these as intentional redactions of real values, not template artifacts.]`;
+  }
 
   pi.on("before_agent_start", async (event, _ctx) => {
     loggedMessageCount = 0;
     if (!config.enabled) return;
-    return { systemPrompt: event.systemPrompt + PII_SYSTEM_NOTE };
+    return { systemPrompt: event.systemPrompt + piiSystemNote() };
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -326,6 +350,9 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    // Detach the crash-restart handler first: the session ctx is already stale
+    // here, and this exit is intentional.
+    serverHandle?.process.removeAllListeners("exit");
     killServer(serverHandle);
     serverHandle = null;
     serverReady = false;
@@ -346,9 +373,9 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
     } catch (err) {
       if (!errorNotifiedThisSession) {
         errorNotifiedThisSession = true;
-        if (ctx.hasUI) {
-          ctx.ui.notify(`PII Filter: redact_batch failed (${String(err)}), passing through unredacted`, "warning");
-        }
+        const msg = `PII Filter: redact_batch failed (${String(err)}), passing through unredacted`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+        else console.error(`[pii-filter] ${msg}`);
       }
       return;
     }
@@ -410,7 +437,7 @@ export default function registerPiiFilter(pi: ExtensionAPI): void {
       if (cmd.action === "status") {
         const serverStatus = serverHandle ? "running" : "stopped";
         ctx.ui.notify(
-          `PII Filter — enabled: ${config.enabled}, logging: ${config.logging}, server: ${serverStatus}, model: ${config.modelId}`,
+          `PII Filter — enabled: ${config.enabled}, logging: ${config.logging}, server: ${serverStatus}, model: ${config.modelId}, ignoreLabels: ${config.ignoreLabels.join(",") || "none"}`,
           "info",
         );
         return;

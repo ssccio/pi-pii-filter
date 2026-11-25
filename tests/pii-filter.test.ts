@@ -249,3 +249,15 @@ describe("parsePiiCommand", () => {
     expect(parsePiiCommand("LOG OFF").action).toBe("logOff");
   });
 });
+
+describe("normalizeConfig ignoreLabels", () => {
+  it("defaults to empty", () => {
+    expect(normalizeConfig({}).ignoreLabels).toEqual([]);
+  });
+  it("keeps only strings", () => {
+    expect(normalizeConfig({ ignoreLabels: ["private_url", 3, null] }).ignoreLabels).toEqual(["private_url"]);
+  });
+  it("rejects non-arrays", () => {
+    expect(normalizeConfig({ ignoreLabels: "private_url" }).ignoreLabels).toEqual([]);
+  });
+});

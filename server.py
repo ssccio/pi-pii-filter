@@ -7,6 +7,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
+def _ignored_labels() -> set:
+    raw = os.environ.get("PII_IGNORE_LABELS", "")
+    return {l.strip() for l in raw.split(",") if l.strip()}
+
+
 class _State:
     ready: bool = False
     classifier: Optional[Callable[[str], List[dict]]] = None
@@ -100,6 +105,12 @@ def _merge_adjacent(entities: List[dict], text: str) -> List[dict]:
 def _redact_one(text: str) -> RedactResult:
     assert state.classifier is not None
     entities: List[dict] = state.classifier(text)
+    ignored = _ignored_labels()
+    if ignored:
+        entities = [
+            e for e in entities
+            if e.get("entity_group", e.get("entity")) not in ignored
+        ]
     entities = _merge_adjacent(entities, text)
     sorted_ents = sorted(entities, key=lambda e: e["start"], reverse=True)
     spans: List[SpanInfo] = []

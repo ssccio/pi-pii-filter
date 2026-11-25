@@ -117,3 +117,16 @@ def test_redact_one_multi_entity_right_to_left():
         assert r.spans[1].original == "john@example.com"
     finally:
         server.state.classifier = original_classifier
+
+
+def test_ignore_labels_skips_entities(monkeypatch):
+    import server
+    ents = [
+        {"entity_group": "private_email", "start": 0, "end": 5},
+        {"entity_group": "private_date", "start": 6, "end": 11},
+    ]
+    monkeypatch.setattr(server.state, "classifier", lambda t: [dict(e) for e in ents])
+    monkeypatch.setenv("PII_IGNORE_LABELS", "private_date")
+    r = server._redact_one("aaaaa bbbbb")
+    assert r.redacted == "[private_email] bbbbb"
+    assert [s.label for s in r.spans] == ["private_email"]
